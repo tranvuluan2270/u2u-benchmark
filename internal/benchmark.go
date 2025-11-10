@@ -1,0 +1,490 @@
+package internal
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/unicornultrafoundation/go-u2u/common"
+	"github.com/unicornultrafoundation/go-u2u/core/types"
+	"github.com/unicornultrafoundation/go-u2u/ethclient"
+)
+
+type Benchmark struct {
+	config   *Config
+	client   *ethclient.Client
+	accounts []*AccountSender
+
+	// Transaction settings
+	transferValue *big.Int
+	gasPrice      *big.Int
+
+	// Metrics
+	sentCount      uint64 // Submitted to RPC
+	confirmedCount uint64 // Confirmed on-chain
+	errorCount     uint64
+	totalLatency   int64 // nanoseconds
+
+	// Per-second metrics
+	tpsHistory          []uint64
+	confirmedTpsHistory []uint64
+
+	// Confirmation tracking
+	pendingTxs chan common.Hash
+
+	// Control
+	stopChan        chan struct{} // For sender workers
+	stopMetricsChan chan struct{} // For metrics reporter
+	wg              sync.WaitGroup
+
+	// Start time
+	startTime time.Time
+}
+
+func NewBenchmark(config *Config, client *ethclient.Client, accounts []*AccountSender) (*Benchmark, error) {
+	transferValue := new(big.Int)
+	transferValue.SetString(config.TransferAmount, 10)
+
+	// Get current gas price
+	ctx := context.Background()
+	gasPrice, err := client.SuggestGasPrice(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get gas price: %v", err)
+	}
+
+	fmt.Printf("\nBenchmark Configuration:\n")
+	fmt.Printf("  Transfer Mode: Round-Robin (Account i → Account i+1)\n")
+	fmt.Printf("  Transfer Value: %s wei\n", transferValue.String())
+	fmt.Printf("  Gas Price: %s wei\n", gasPrice.String())
+	fmt.Printf("  Gas Limit: %d\n", config.GasLimit)
+	fmt.Printf("  Duration: %v\n", config.GetDuration())
+	fmt.Printf("  Accounts: %d\n", len(accounts))
+
+	return &Benchmark{
+		config:              config,
+		client:              client,
+		accounts:            accounts,
+		transferValue:       transferValue,
+		gasPrice:            gasPrice,
+		stopChan:            make(chan struct{}),
+		stopMetricsChan:     make(chan struct{}),
+		tpsHistory:          make([]uint64, 0),
+		confirmedTpsHistory: make([]uint64, 0),
+		pendingTxs:          make(chan common.Hash, 10000), // Buffer for pending tx hashes
+	}, nil
+}
+
+func (b *Benchmark) Start() {
+	fmt.Println("\n" + strings.Repeat("=", 70))
+	fmt.Println("STARTING BENCHMARK")
+	fmt.Println(strings.Repeat("=", 70))
+
+	b.startTime = time.Now()
+
+	// Warmup phase
+	if b.config.WarmupDuration > 0 {
+		fmt.Printf("\n🔥 Warmup phase: %d seconds\n", b.config.WarmupDuration)
+		b.warmup(time.Duration(b.config.WarmupDuration) * time.Second)
+	}
+
+	// Reset metrics after warmup
+	atomic.StoreUint64(&b.sentCount, 0)
+	atomic.StoreUint64(&b.confirmedCount, 0)
+	atomic.StoreUint64(&b.errorCount, 0)
+	atomic.StoreInt64(&b.totalLatency, 0)
+	b.startTime = time.Now()
+
+	// Clear pending transactions from warmup phase
+	b.clearPendingTxs()
+
+	fmt.Printf("\n🚀 Starting main benchmark...")
+
+	// Start sender goroutines
+	for i, account := range b.accounts {
+		b.wg.Add(1)
+		go b.senderWorker(i, account)
+	}
+
+	// Start metrics reporter
+	go b.metricsReporter()
+
+	// Start confirmation tracker
+	go b.confirmationTracker()
+
+	// Run for specified duration
+	time.Sleep(b.config.GetDuration())
+
+	// Capture metrics EXACTLY at duration end (before stopping senders)
+	finalSent := atomic.LoadUint64(&b.sentCount)
+	finalErrors := atomic.LoadUint64(&b.errorCount)
+	finalLatency := atomic.LoadInt64(&b.totalLatency)
+
+	// Stop sender workers immediately (no more transactions)
+	close(b.stopChan)
+	b.wg.Wait()
+
+	// Give metrics reporter time to print the final line
+	time.Sleep(150 * time.Millisecond)
+
+	// Stop metrics reporter
+	close(b.stopMetricsChan)
+
+	fmt.Println("\n⏸️  Benchmark stopped")
+
+	b.printFinalReport(finalSent, finalErrors, finalLatency)
+}
+
+func (b *Benchmark) warmup(duration time.Duration) {
+	warmupStop := make(chan struct{})
+
+	// Start one sender per account
+	var warmupWg sync.WaitGroup
+	for i, account := range b.accounts {
+		warmupWg.Add(1)
+		go func(accountID int, acc *AccountSender) {
+			defer warmupWg.Done()
+			ctx := context.Background()
+
+			for {
+				select {
+				case <-warmupStop:
+					return
+				default:
+					_ = b.sendTransaction(ctx, accountID, acc)
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
+		}(i, account)
+	}
+
+	time.Sleep(duration)
+	close(warmupStop)
+	warmupWg.Wait()
+}
+
+func (b *Benchmark) clearPendingTxs() {
+	// Drain all pending transaction hashes from warmup phase
+	for {
+		select {
+		case <-b.pendingTxs:
+			// Discard warmup transaction hash
+		default:
+			// Channel is empty, we're done
+			return
+		}
+	}
+}
+
+func (b *Benchmark) senderWorker(id int, account *AccountSender) {
+	defer b.wg.Done()
+
+	ctx := context.Background()
+	consecutiveErrors := 0
+
+	for {
+		select {
+		case <-b.stopChan:
+			return
+		default:
+			start := time.Now()
+			err := b.sendTransaction(ctx, id, account)
+			latency := time.Since(start)
+
+			if err != nil {
+				atomic.AddUint64(&b.errorCount, 1)
+				account.errors++
+				consecutiveErrors++
+
+				// Back off on consecutive errors
+				if consecutiveErrors < 5 {
+					time.Sleep(time.Duration(consecutiveErrors*100) * time.Millisecond)
+				}
+
+				// Resync nonce on error
+				if isNoneError(err) {
+					account.ResyncNonce(ctx)
+				}
+			} else {
+				atomic.AddUint64(&b.sentCount, 1)
+				atomic.AddInt64(&b.totalLatency, latency.Nanoseconds())
+				account.sent++
+				consecutiveErrors = 0
+			}
+		}
+	}
+}
+
+func (b *Benchmark) sendTransaction(ctx context.Context, accountID int, account *AccountSender) error {
+	nonce := account.GetNextNonce()
+
+	// Round-robin: Account i sends to Account (i+1) % total_accounts
+	targetIndex := (accountID + 1) % len(b.accounts)
+	targetAddress := b.accounts[targetIndex].from
+
+	tx := types.NewTransaction(
+		nonce,
+		targetAddress,
+		b.transferValue,
+		b.config.GasLimit,
+		b.gasPrice,
+		nil,
+	)
+
+	signedTx, err := types.SignTx(tx, types.NewEIP155Signer(account.chainID), account.privateKey)
+	if err != nil {
+		return fmt.Errorf("failed to sign transaction: %v", err)
+	}
+
+	err = account.client.SendTransaction(ctx, signedTx)
+	if err != nil {
+		return err
+	}
+
+	// Send tx hash for confirmation tracking
+	select {
+	case b.pendingTxs <- signedTx.Hash():
+	default:
+		// Channel full, skip tracking this one
+	}
+
+	return nil
+}
+
+func (b *Benchmark) confirmationTracker() {
+	ctx := context.Background()
+	for {
+		select {
+		case <-b.stopMetricsChan:
+			return
+		case txHash := <-b.pendingTxs:
+			// Check if transaction is confirmed (non-blocking)
+			go func(hash common.Hash) {
+				// Try to get receipt (with timeout)
+				ctxTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+
+				receipt, err := b.client.TransactionReceipt(ctxTimeout, hash)
+				if err == nil && receipt != nil && receipt.Status == 1 {
+					atomic.AddUint64(&b.confirmedCount, 1)
+				}
+			}(txHash)
+		}
+	}
+}
+
+func (b *Benchmark) metricsReporter() {
+	ticker := time.NewTicker(time.Duration(b.config.ReportInterval) * time.Second)
+	defer ticker.Stop()
+
+	lastSent := uint64(0)
+	lastConfirmed := uint64(0)
+	reportCount := 0
+
+	fmt.Println("\n" + strings.Repeat("-", 85))
+	fmt.Printf("%-10s | %-13s | %-15s | %-10s | %-12s\n",
+		"Time", "Submitted TPS", "Total Submitted", "Errors", "Avg Latency")
+	fmt.Println(strings.Repeat("-", 85))
+
+	for {
+		select {
+		case <-b.stopMetricsChan:
+			return
+		case <-ticker.C:
+			reportCount++
+			sent := atomic.LoadUint64(&b.sentCount)
+			confirmed := atomic.LoadUint64(&b.confirmedCount)
+			errors := atomic.LoadUint64(&b.errorCount)
+			totalLat := atomic.LoadInt64(&b.totalLatency)
+
+			submittedTPS := sent - lastSent
+			confirmedTPS := confirmed - lastConfirmed
+			b.tpsHistory = append(b.tpsHistory, submittedTPS)
+			b.confirmedTpsHistory = append(b.confirmedTpsHistory, confirmedTPS)
+
+			avgLatency := time.Duration(0)
+			if sent > 0 {
+				avgLatency = time.Duration(totalLat / int64(sent))
+			}
+
+			elapsed := time.Since(b.startTime)
+			fmt.Printf("%-10s | %-13d | %-15d | %-10d | %-12s\n",
+				formatDuration(elapsed), submittedTPS, sent, errors,
+				avgLatency.Round(time.Millisecond))
+
+			lastSent = sent
+			lastConfirmed = confirmed
+		}
+	}
+}
+
+func (b *Benchmark) printFinalReport(sent, errors uint64, totalLat int64) {
+	elapsed := time.Since(b.startTime)
+
+	avgSubmittedTPS := float64(sent) / elapsed.Seconds()
+	avgLatency := time.Duration(0)
+	if sent > 0 {
+		avgLatency = time.Duration(totalLat / int64(sent))
+	}
+
+	// Calculate min/max/median TPS for submitted
+	minSubmittedTPS, maxSubmittedTPS, medianSubmittedTPS := calculateTPSStats(b.tpsHistory)
+
+	fmt.Println("\n" + strings.Repeat("=", 70))
+	fmt.Println("BENCHMARK RESULTS")
+	fmt.Println(strings.Repeat("=", 70))
+
+	fmt.Printf("\n📊 Overall Statistics:\n")
+	fmt.Printf("  Duration:           %v\n", elapsed.Round(time.Second))
+	fmt.Printf("  Total Submitted:    %d transactions\n", sent)
+	fmt.Printf("  Total Errors:       %d transactions\n", errors)
+	fmt.Printf("  RPC Accept Rate:    %.2f%%\n", float64(sent)/float64(sent+errors)*100)
+
+	fmt.Printf("\n⚡ Submitted TPS Metrics:\n")
+	fmt.Printf("  Average TPS:        %.2f\n", avgSubmittedTPS)
+	fmt.Printf("  Peak TPS:           %d\n", maxSubmittedTPS)
+	fmt.Printf("  Minimum TPS:        %d\n", minSubmittedTPS)
+	fmt.Printf("  Median TPS:         %d\n", medianSubmittedTPS)
+
+	fmt.Printf("\n⏱️  Latency:\n")
+	fmt.Printf("  Average Latency:    %v\n", avgLatency.Round(time.Millisecond))
+
+	fmt.Printf("\n👥 Per-Account Statistics:\n")
+	for i, account := range b.accounts {
+		fmt.Printf("  Account %2d: %6d sent, %4d errors (%.1f%%)\n",
+			i, account.sent, account.errors,
+			float64(account.sent)/float64(account.sent+account.errors)*100)
+	}
+
+	fmt.Println("\n" + strings.Repeat("=", 70))
+
+	// Save results
+	b.saveResults(elapsed, avgSubmittedTPS, sent, errors,
+		minSubmittedTPS, maxSubmittedTPS, medianSubmittedTPS, avgLatency)
+}
+
+func (b *Benchmark) saveResults(duration time.Duration, avgSubmittedTPS float64, sent, errors uint64,
+	minSubmittedTPS, maxSubmittedTPS, medianSubmittedTPS uint64, avgLatency time.Duration) {
+
+	// Calculate rates
+	rpcAcceptRate := 0.0
+	if sent+errors > 0 {
+		rpcAcceptRate = float64(sent) / float64(sent+errors) * 100
+	}
+
+	// Collect per-account statistics
+	accountStats := make([]map[string]interface{}, 0, len(b.accounts))
+	for i, account := range b.accounts {
+		accountSuccessRate := 100.0
+		if account.sent+account.errors > 0 {
+			accountSuccessRate = float64(account.sent) / float64(account.sent+account.errors) * 100
+		}
+		accountStats = append(accountStats, map[string]interface{}{
+			"account_id":   i,
+			"address":      account.from.Hex(),
+			"sent":         account.sent,
+			"errors":       account.errors,
+			"success_rate": accountSuccessRate,
+		})
+	}
+
+	// Use struct to ensure consistent field order
+	type BenchmarkResults struct {
+		Timestamp           string                   `json:"timestamp"`
+		Config              map[string]interface{}   `json:"config"`
+		TotalSubmitted      uint64                   `json:"total_submitted"`
+		TotalErrors         uint64                   `json:"total_errors"`
+		RPCAcceptRate       float64                  `json:"rpc_accept_rate"`
+		AvgSubmittedTPS     float64                  `json:"average_submitted_tps"`
+		PeakSubmittedTPS    uint64                   `json:"peak_submitted_tps"`
+		MinSubmittedTPS     uint64                   `json:"min_submitted_tps"`
+		MedianSubmittedTPS  uint64                   `json:"median_submitted_tps"`
+		AvgLatencyMs        int64                    `json:"average_latency_ms"`
+		SubmittedTPSHistory []uint64                 `json:"submitted_tps_history"`
+		AccountStats        []map[string]interface{} `json:"account_statistics"`
+	}
+
+	results := BenchmarkResults{
+		Timestamp: time.Now().Format(time.RFC3339),
+		Config: map[string]interface{}{
+			"rpc_url":             b.config.RPCURL,
+			"gas_limit":           b.config.GasLimit,
+			"transfer_amount_wei": b.config.TransferAmount,
+			"warmup_duration":     b.config.WarmupDuration,
+			"duration_seconds":    duration.Seconds(),
+			"num_accounts":        len(b.accounts),
+		},
+		TotalSubmitted:      sent,
+		TotalErrors:         errors,
+		RPCAcceptRate:       rpcAcceptRate,
+		AvgSubmittedTPS:     avgSubmittedTPS,
+		PeakSubmittedTPS:    maxSubmittedTPS,
+		MinSubmittedTPS:     minSubmittedTPS,
+		MedianSubmittedTPS:  medianSubmittedTPS,
+		AvgLatencyMs:        avgLatency.Milliseconds(),
+		SubmittedTPSHistory: b.tpsHistory,
+		AccountStats:        accountStats,
+	}
+
+	file, err := os.Create(b.config.OutputFile)
+	if err != nil {
+		fmt.Printf("Failed to save results: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	encoder.Encode(results)
+
+	fmt.Printf("📝 Results saved to %s\n", b.config.OutputFile)
+}
+
+// Helper functions
+
+func isNoneError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "nonce") ||
+		strings.Contains(errStr, "too low") ||
+		strings.Contains(errStr, "already known")
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	m := d / time.Minute
+	s := (d % time.Minute) / time.Second
+	return fmt.Sprintf("%02d:%02d", m, s)
+}
+
+func calculateTPSStats(tpsHistory []uint64) (min, max, median uint64) {
+	if len(tpsHistory) == 0 {
+		return 0, 0, 0
+	}
+
+	// Make a copy and sort
+	sorted := make([]uint64, len(tpsHistory))
+	copy(sorted, tpsHistory)
+
+	// Bubble sort (ascending order)
+	for i := 0; i < len(sorted)-1; i++ {
+		for j := 0; j < len(sorted)-i-1; j++ {
+			if sorted[j] > sorted[j+1] {
+				sorted[j], sorted[j+1] = sorted[j+1], sorted[j]
+			}
+		}
+	}
+
+	min = sorted[0]
+	max = sorted[len(sorted)-1]
+	median = sorted[len(sorted)/2]
+
+	return
+}

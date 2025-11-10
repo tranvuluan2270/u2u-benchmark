@@ -1,0 +1,13 @@
+{
+  "rpc_url": "https://rpc-nebulas-testnet.uniultra.xyz",
+  "num_accounts": 10,
+  "duration_seconds": 60,
+  "gas_limit": 21000,
+  "transfer_amount_wei": "1000000000000000",
+  "private_keys_file": "test_keys.json",
+  "report_interval_seconds": 1,
+  "output_file": "benchmark_results.json",
+  "max_retries": 5,
+  "retry_delay_ms": 150,
+  "warmup_duration_seconds": 5
+}

@@ -1,0 +1,36 @@
+# Sensitive files - DO NOT COMMIT
+my_test_keys.json
+test_keys.json
+*_keys.json
+!*_keys.json.example
+
+# Environment files
+.env
+*.env
+
+# Results
+benchmark_results.json
+*_results.json
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
