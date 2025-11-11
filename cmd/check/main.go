@@ -98,7 +98,7 @@ func main() {
 	// Check nonce sync for each account
 	fmt.Println(strings.Repeat("=", 100))
 	fmt.Printf("%-8s | %-20s | %-15s | %-15s | %-15s | %-10s\n",
-		"Account", "Address", "Confirmed Nonce", "Pending Nonce", "Local Nonce", "Status")
+		"Account", "Address", "Confirmed Nonce", "Next Nonce", "Local Nonce", "Status")
 	fmt.Println(strings.Repeat("=", 100))
 
 	totalPending := 0

@@ -147,7 +147,7 @@ func InitializeAccounts(client *ethclient.Client, privateKeys []*ecdsa.PrivateKe
 			new(big.Float).SetInt(big.NewInt(1e18)),
 		)
 
-		fmt.Printf("Account %d: %s (pending nonce: %d, balance: %.6f U2U)\n",
+		fmt.Printf("Account %d: %s (next nonce: %d, balance: %.6f U2U)\n",
 			i, from.Hex(), nonce, balanceEth)
 	}
 
@@ -191,13 +191,19 @@ func CheckBalances(client *ethclient.Client, accounts []*AccountSender, minBalan
 	return nil
 }
 
-// GetNextNonce returns and increments the nonce (thread-safe)
+// GetNextNonce returns the current nonce WITHOUT incrementing (thread-safe)
+// Call IncrementNonce() after successful transaction submission
 func (a *AccountSender) GetNextNonce() uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	nonce := a.nonce
+	return a.nonce
+}
+
+// IncrementNonce increments the local nonce after successful submission
+func (a *AccountSender) IncrementNonce() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.nonce++
-	return nonce
 }
 
 // ResyncNonce fetches nonce from blockchain

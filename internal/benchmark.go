@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"os"
 	"strings"
 	"sync"
@@ -184,18 +185,64 @@ func (b *Benchmark) clearPendingTxs() {
 func (b *Benchmark) senderWorker(id int, account *AccountSender) {
 	defer b.wg.Done()
 
+	// Stagger start to avoid thundering herd problem
+	// Spread accounts over 1 second with random jitter
+	baseDelay := time.Duration(id*10) * time.Millisecond
+	jitter := time.Duration(rand.Intn(50)) * time.Millisecond
+	time.Sleep(baseDelay + jitter)
+
 	ctx := context.Background()
 	consecutiveErrors := 0
+	const maxRetriesPerNonce = 5
+	firstTransaction := true
 
 	for {
 		select {
 		case <-b.stopChan:
 			return
 		default:
-			start := time.Now()
-			err := b.sendTransaction(ctx, id, account)
-			latency := time.Since(start)
+			var err error
+			var latency time.Duration
 
+			// Retry logic: attempt same nonce multiple times before giving up
+			// Give first transaction extra retries to handle initial congestion
+			maxRetries := maxRetriesPerNonce
+			if firstTransaction {
+				maxRetries = 8 // More retries for initial connection
+			}
+
+			for retry := 0; retry < maxRetries; retry++ {
+				start := time.Now()
+				err = b.sendTransaction(ctx, id, account)
+				latency = time.Since(start)
+
+				if err == nil {
+					// Success! Increment nonce for next transaction
+					account.IncrementNonce()
+					atomic.AddUint64(&b.sentCount, 1)
+					atomic.AddInt64(&b.totalLatency, latency.Nanoseconds())
+					account.sent++
+					consecutiveErrors = 0
+					firstTransaction = false
+					break
+				}
+
+				// Check if it's a nonce-related error
+				if isNonceError(err) {
+					// Nonce error - resync and break retry loop
+					account.ResyncNonce(ctx)
+					break
+				}
+
+				// For non-nonce errors (network, timeout), retry with same nonce
+				if retry < maxRetries-1 {
+					// Exponential backoff: 50ms, 100ms, 150ms, 200ms, etc.
+					backoff := time.Duration((retry+1)*50) * time.Millisecond
+					time.Sleep(backoff)
+				}
+			}
+
+			// If all retries failed, count as error
 			if err != nil {
 				atomic.AddUint64(&b.errorCount, 1)
 				account.errors++
@@ -206,18 +253,25 @@ func (b *Benchmark) senderWorker(id int, account *AccountSender) {
 					time.Sleep(time.Duration(consecutiveErrors*100) * time.Millisecond)
 				}
 
-				// Resync nonce on error
-				if isNoneError(err) {
+				// Resync nonce periodically when stuck
+				if consecutiveErrors >= 3 {
 					account.ResyncNonce(ctx)
 				}
-			} else {
-				atomic.AddUint64(&b.sentCount, 1)
-				atomic.AddInt64(&b.totalLatency, latency.Nanoseconds())
-				account.sent++
-				consecutiveErrors = 0
 			}
 		}
 	}
+}
+
+// Helper function to detect nonce-related errors
+func isNonceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "nonce") ||
+		strings.Contains(errStr, "nonce too low") ||
+		strings.Contains(errStr, "already known") ||
+		strings.Contains(errStr, "replacement transaction underpriced")
 }
 
 func (b *Benchmark) sendTransaction(ctx context.Context, accountID int, account *AccountSender) error {
@@ -446,16 +500,6 @@ func (b *Benchmark) saveResults(duration time.Duration, avgSubmittedTPS float64,
 }
 
 // Helper functions
-
-func isNoneError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "nonce") ||
-		strings.Contains(errStr, "too low") ||
-		strings.Contains(errStr, "already known")
-}
 
 func formatDuration(d time.Duration) string {
 	d = d.Round(time.Second)

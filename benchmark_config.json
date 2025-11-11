@@ -1,6 +1,6 @@
 {
   "rpc_url": "https://rpc-nebulas-testnet.uniultra.xyz",
-  "num_accounts": 10,
+  "num_accounts": 100,
   "duration_seconds": 60,
   "gas_limit": 21000,
   "transfer_amount_wei": "1000000000000000",
