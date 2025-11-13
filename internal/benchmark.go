@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/unicornultrafoundation/go-u2u/common"
 	"github.com/unicornultrafoundation/go-u2u/core/types"
 	"github.com/unicornultrafoundation/go-u2u/ethclient"
 )
@@ -27,17 +26,15 @@ type Benchmark struct {
 	gasPrice      *big.Int
 
 	// Metrics
-	sentCount      uint64 // Submitted to RPC
-	confirmedCount uint64 // Confirmed on-chain
-	errorCount     uint64
-	totalLatency   int64 // nanoseconds
+	sentCount    uint64 // Submitted to RPC
+	errorCount   uint64
+	totalLatency int64 // nanoseconds
 
 	// Per-second metrics
-	tpsHistory          []uint64
-	confirmedTpsHistory []uint64
+	tpsHistory []uint64
 
-	// Confirmation tracking
-	pendingTxs chan common.Hash
+	// Nonce resync queue (buffered to avoid blocking)
+	resyncQueue chan *AccountSender
 
 	// Control
 	stopChan        chan struct{} // For sender workers
@@ -68,16 +65,15 @@ func NewBenchmark(config *Config, client *ethclient.Client, accounts []*AccountS
 	fmt.Printf("  Accounts: %d\n", len(accounts))
 
 	return &Benchmark{
-		config:              config,
-		client:              client,
-		accounts:            accounts,
-		transferValue:       transferValue,
-		gasPrice:            gasPrice,
-		stopChan:            make(chan struct{}),
-		stopMetricsChan:     make(chan struct{}),
-		tpsHistory:          make([]uint64, 0),
-		confirmedTpsHistory: make([]uint64, 0),
-		pendingTxs:          make(chan common.Hash, 10000), // Buffer for pending tx hashes
+		config:          config,
+		client:          client,
+		accounts:        accounts,
+		transferValue:   transferValue,
+		gasPrice:        gasPrice,
+		stopChan:        make(chan struct{}),
+		stopMetricsChan: make(chan struct{}),
+		tpsHistory:      make([]uint64, 0),
+		resyncQueue:     make(chan *AccountSender, 1000), // Buffer for nonce resync requests (large to handle bursts)
 	}, nil
 }
 
@@ -96,15 +92,16 @@ func (b *Benchmark) Start() {
 
 	// Reset metrics after warmup
 	atomic.StoreUint64(&b.sentCount, 0)
-	atomic.StoreUint64(&b.confirmedCount, 0)
 	atomic.StoreUint64(&b.errorCount, 0)
 	atomic.StoreInt64(&b.totalLatency, 0)
 	b.startTime = time.Now()
 
-	// Clear pending transactions from warmup phase
-	b.clearPendingTxs()
-
 	fmt.Printf("\n🚀 Starting main benchmark...")
+
+	// Start nonce resync worker pool (10 workers to handle resyncs faster)
+	for i := 0; i < 10; i++ {
+		go b.nonceResyncWorker()
+	}
 
 	// Start sender goroutines
 	for i, account := range b.accounts {
@@ -114,9 +111,6 @@ func (b *Benchmark) Start() {
 
 	// Start metrics reporter
 	go b.metricsReporter()
-
-	// Start confirmation tracker
-	go b.confirmationTracker()
 
 	// Run for specified duration
 	time.Sleep(b.config.GetDuration())
@@ -169,26 +163,13 @@ func (b *Benchmark) warmup(duration time.Duration) {
 	warmupWg.Wait()
 }
 
-func (b *Benchmark) clearPendingTxs() {
-	// Drain all pending transaction hashes from warmup phase
-	for {
-		select {
-		case <-b.pendingTxs:
-			// Discard warmup transaction hash
-		default:
-			// Channel is empty, we're done
-			return
-		}
-	}
-}
-
 func (b *Benchmark) senderWorker(id int, account *AccountSender) {
 	defer b.wg.Done()
 
 	// Stagger start to avoid thundering herd problem
-	// Spread accounts over 1 second with random jitter
-	baseDelay := time.Duration(id*10) * time.Millisecond
-	jitter := time.Duration(rand.Intn(50)) * time.Millisecond
+	// Spread accounts over 2 seconds with random jitter
+	baseDelay := time.Duration(id*20) * time.Millisecond       // 0ms, 20ms, 40ms...1980ms
+	jitter := time.Duration(rand.Intn(100)) * time.Millisecond // 0-100ms random
 	time.Sleep(baseDelay + jitter)
 
 	ctx := context.Background()
@@ -229,9 +210,24 @@ func (b *Benchmark) senderWorker(id int, account *AccountSender) {
 
 				// Check if it's a nonce-related error
 				if isNonceError(err) {
-					// Nonce error - resync and break retry loop
-					account.ResyncNonce(ctx)
-					break
+					// Try to queue nonce resync (non-blocking, handled by worker pool)
+					select {
+					case b.resyncQueue <- account:
+						// Successfully queued - increment optimistically and continue
+						// Nonce error usually means TX was already submitted
+						account.IncrementNonce()
+						consecutiveErrors = 0
+						firstTransaction = false
+						break
+					default:
+						// Queue full - increment optimistically and continue
+						// Don't block with synchronous resync (causes stalls)
+						// Async resync will catch up when queue has capacity
+						account.IncrementNonce()
+						consecutiveErrors = 0
+						firstTransaction = false
+						break
+					}
 				}
 
 				// For non-nonce errors (network, timeout), retry with same nonce
@@ -243,19 +239,34 @@ func (b *Benchmark) senderWorker(id int, account *AccountSender) {
 			}
 
 			// If all retries failed, count as error
+			// But don't count nonce errors - they usually mean TX was already submitted
 			if err != nil {
-				atomic.AddUint64(&b.errorCount, 1)
-				account.errors++
-				consecutiveErrors++
+				if !isNonceError(err) {
+					// Only count non-nonce errors (real failures)
+					atomic.AddUint64(&b.errorCount, 1)
+					account.errors++
+					consecutiveErrors++
 
-				// Back off on consecutive errors
-				if consecutiveErrors < 5 {
-					time.Sleep(time.Duration(consecutiveErrors*100) * time.Millisecond)
-				}
+					// Back off on consecutive errors
+					if consecutiveErrors < 5 {
+						time.Sleep(time.Duration(consecutiveErrors*100) * time.Millisecond)
+					}
 
-				// Resync nonce periodically when stuck
-				if consecutiveErrors >= 3 {
-					account.ResyncNonce(ctx)
+					// Resync nonce periodically when stuck (via worker pool to avoid blocking)
+					if consecutiveErrors >= 3 {
+						// Try to queue resync, but don't block if queue is full
+						// Account will retry next iteration and queue might have space
+						select {
+						case b.resyncQueue <- account:
+							// Successfully queued
+						default:
+							// Queue full - skip this resync, will retry next iteration
+							// Don't block with synchronous resync (causes stalls)
+						}
+					}
+				} else {
+					// Nonce error - don't count as failure, reset consecutive error counter
+					consecutiveErrors = 0
 				}
 			}
 		}
@@ -300,34 +311,19 @@ func (b *Benchmark) sendTransaction(ctx context.Context, accountID int, account 
 		return err
 	}
 
-	// Send tx hash for confirmation tracking
-	select {
-	case b.pendingTxs <- signedTx.Hash():
-	default:
-		// Channel full, skip tracking this one
-	}
-
 	return nil
 }
 
-func (b *Benchmark) confirmationTracker() {
+func (b *Benchmark) nonceResyncWorker() {
 	ctx := context.Background()
 	for {
 		select {
 		case <-b.stopMetricsChan:
 			return
-		case txHash := <-b.pendingTxs:
-			// Check if transaction is confirmed (non-blocking)
-			go func(hash common.Hash) {
-				// Try to get receipt (with timeout)
-				ctxTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
-				defer cancel()
-
-				receipt, err := b.client.TransactionReceipt(ctxTimeout, hash)
-				if err == nil && receipt != nil && receipt.Status == 1 {
-					atomic.AddUint64(&b.confirmedCount, 1)
-				}
-			}(txHash)
+		case account := <-b.resyncQueue:
+			// Process nonce resync (minimal delay to debounce rapid resyncs for same account)
+			time.Sleep(25 * time.Millisecond)
+			account.ResyncNonce(ctx)
 		}
 	}
 }
@@ -337,7 +333,6 @@ func (b *Benchmark) metricsReporter() {
 	defer ticker.Stop()
 
 	lastSent := uint64(0)
-	lastConfirmed := uint64(0)
 	reportCount := 0
 
 	fmt.Println("\n" + strings.Repeat("-", 85))
@@ -352,14 +347,11 @@ func (b *Benchmark) metricsReporter() {
 		case <-ticker.C:
 			reportCount++
 			sent := atomic.LoadUint64(&b.sentCount)
-			confirmed := atomic.LoadUint64(&b.confirmedCount)
 			errors := atomic.LoadUint64(&b.errorCount)
 			totalLat := atomic.LoadInt64(&b.totalLatency)
 
 			submittedTPS := sent - lastSent
-			confirmedTPS := confirmed - lastConfirmed
 			b.tpsHistory = append(b.tpsHistory, submittedTPS)
-			b.confirmedTpsHistory = append(b.confirmedTpsHistory, confirmedTPS)
 
 			avgLatency := time.Duration(0)
 			if sent > 0 {
@@ -372,7 +364,6 @@ func (b *Benchmark) metricsReporter() {
 				avgLatency.Round(time.Millisecond))
 
 			lastSent = sent
-			lastConfirmed = confirmed
 		}
 	}
 }

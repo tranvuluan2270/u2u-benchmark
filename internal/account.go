@@ -147,7 +147,7 @@ func InitializeAccounts(client *ethclient.Client, privateKeys []*ecdsa.PrivateKe
 			new(big.Float).SetInt(big.NewInt(1e18)),
 		)
 
-		fmt.Printf("Account %d: %s (next nonce: %d, balance: %.6f U2U)\n",
+		fmt.Printf("Account %d: %s (nonce: %d, balance: %.6f U2U)\n",
 			i, from.Hex(), nonce, balanceEth)
 	}
 

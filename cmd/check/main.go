@@ -97,8 +97,8 @@ func main() {
 
 	// Check nonce sync for each account
 	fmt.Println(strings.Repeat("=", 100))
-	fmt.Printf("%-8s | %-20s | %-15s | %-15s | %-15s | %-10s\n",
-		"Account", "Address", "Confirmed Nonce", "Next Nonce", "Local Nonce", "Status")
+	fmt.Printf("%-8s | %-42s | %-15s | %-10s\n",
+		"Account", "Address", "Confirmed Nonce", "Status")
 	fmt.Println(strings.Repeat("=", 100))
 
 	totalPending := 0
@@ -119,12 +119,6 @@ func main() {
 			continue
 		}
 
-		// Calculate last confirmed nonce (what explorer shows)
-		lastConfirmedNonce := uint64(0)
-		if nextConfirmedNonce > 0 {
-			lastConfirmedNonce = nextConfirmedNonce - 1
-		}
-
 		// Get local nonce (from AccountSender)
 		// Resync first to get the latest from blockchain
 		account.ResyncNonce(ctx)
@@ -134,6 +128,12 @@ func main() {
 		pendingTxs := int(nextPendingNonce - nextConfirmedNonce)
 		if pendingTxs > 0 {
 			totalPending += pendingTxs
+		}
+
+		// Calculate last confirmed nonce (what was actually confirmed on-chain)
+		lastConfirmedNonce := uint64(0)
+		if nextConfirmedNonce > 0 {
+			lastConfirmedNonce = nextConfirmedNonce - 1
 		}
 
 		// Determine status
@@ -147,9 +147,9 @@ func main() {
 			allSynced = false
 		}
 
-		addrShort := account.From().Hex()[:8] + "..." + account.From().Hex()[len(account.From().Hex())-6:]
-		fmt.Printf("%-8d | %-20s | %-15d | %-15d | %-15d | %-10s\n",
-			i, addrShort, lastConfirmedNonce, nextPendingNonce, localNonce, status)
+		Address := account.From().Hex()
+		fmt.Printf("%-8d | %-42s | %-15d | %-10s\n",
+			i, Address, lastConfirmedNonce, status)
 	}
 
 	fmt.Println(strings.Repeat("=", 100))
