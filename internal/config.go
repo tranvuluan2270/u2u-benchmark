@@ -26,9 +26,11 @@ type Config struct {
 	OutputFile     string `json:"output_file"`
 
 	// Advanced
-	MaxRetries     int `json:"max_retries"`
-	RetryDelay     int `json:"retry_delay_ms"`
-	WarmupDuration int `json:"warmup_duration_seconds"`
+	MaxRetries int `json:"max_retries"`
+	RetryDelay int `json:"retry_delay_ms"`
+
+	// Throughput optimization
+	ConcurrentSendersPerAccount int `json:"concurrent_senders_per_account"` // Number of parallel senders per account
 }
 
 // GetDuration returns the duration as time.Duration
@@ -55,17 +57,17 @@ func LoadConfig(filename string) (*Config, error) {
 
 func DefaultConfig() *Config {
 	return &Config{
-		RPCURL:          "https://rpc-nebulas-testnet.uniultra.xyz",
-		NumAccounts:     10,
-		DurationSeconds: 60, // Duration in seconds
-		GasLimit:        21000,
-		TransferAmount:  "1000000000000000", // 0.001 U2U
-		ReportInterval:  1,
-		OutputFile:      "benchmark_results.json",
-		MaxRetries:      3,
-		RetryDelay:      100,
-		WarmupDuration:  5,
-		PrivateKeysFile: "test_keys.json",
+		RPCURL:                      "https://rpc-nebulas-testnet.uniultra.xyz",
+		NumAccounts:                 10,
+		DurationSeconds:             60, // Duration in seconds
+		GasLimit:                    21000,
+		TransferAmount:              "1000000000000000", // 0.001 U2U
+		ReportInterval:              1,
+		OutputFile:                  "benchmark_results.json",
+		MaxRetries:                  3,
+		RetryDelay:                  100,
+		PrivateKeysFile:             "test_keys.json",
+		ConcurrentSendersPerAccount: 0, // parallel senders per account
 	}
 }
 

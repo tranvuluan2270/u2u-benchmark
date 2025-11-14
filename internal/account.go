@@ -3,17 +3,21 @@ package internal
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"net/http"
 	"os"
 	"strings"
-	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/unicornultrafoundation/go-u2u/common"
 	"github.com/unicornultrafoundation/go-u2u/crypto"
 	"github.com/unicornultrafoundation/go-u2u/ethclient"
+	"github.com/unicornultrafoundation/go-u2u/rpc"
 )
 
 type AccountSender struct {
@@ -21,16 +25,50 @@ type AccountSender struct {
 	privateKey *ecdsa.PrivateKey
 	from       common.Address
 	chainID    *big.Int
-	nonce      uint64
-	mu         sync.Mutex
+	nonce      uint64 // Atomic nonce counter (use atomic operations only!)
 
-	// Statistics per account
+	// Statistics per account (atomic)
 	sent   uint64
 	errors uint64
 }
 
 type KeyStore struct {
 	Keys []string `json:"private_keys"`
+}
+
+// CreateOptimizedClient creates an ethclient with optimized HTTP connection pooling
+// This allows thousands of concurrent requests without connection overhead
+func CreateOptimizedClient(rpcURL string, maxConnections int) (*ethclient.Client, error) {
+	// Create aggressive HTTP transport for high throughput
+	// Force HTTP/1.1 by setting TLSNextProto to empty map to avoid HTTP/2 GOAWAY errors
+	transport := &http.Transport{
+		MaxIdleConns:          maxConnections,
+		MaxIdleConnsPerHost:   maxConnections,
+		MaxConnsPerHost:       maxConnections,
+		IdleConnTimeout:       90 * time.Second,
+		DisableKeepAlives:     false,                  // Keep connections alive
+		DisableCompression:    true,                   // Reduce CPU overhead
+		TLSHandshakeTimeout:   5 * time.Second,        // Faster TLS handshake timeout
+		ExpectContinueTimeout: 500 * time.Millisecond, // Faster expect-continue
+		ResponseHeaderTimeout: 5 * time.Second,        // Don't wait forever for headers
+		// Disable HTTP/2 by setting TLSNextProto to empty map (forces HTTP/1.1)
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+	}
+
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second, // Aggressive timeout for fast failure
+	}
+
+	// Create RPC client with our optimized HTTP client
+	rpcClient, err := rpc.DialHTTPWithClient(rpcURL, httpClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial RPC: %v", err)
+	}
+
+	// Wrap with ethclient
+	client := ethclient.NewClient(rpcClient)
+	return client, nil
 }
 
 // GenerateAccounts creates new private keys
@@ -149,6 +187,12 @@ func InitializeAccounts(client *ethclient.Client, privateKeys []*ecdsa.PrivateKe
 
 		fmt.Printf("Account %d: %s (nonce: %d, balance: %.6f U2U)\n",
 			i, from.Hex(), nonce, balanceEth)
+
+		// Small delay to avoid overwhelming RPC during initialization
+		// Only add delay every 10 accounts to balance speed vs stability
+		if (i+1)%10 == 0 && i < len(privateKeys)-1 {
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
 
 	return accounts, nil
@@ -191,32 +235,26 @@ func CheckBalances(client *ethclient.Client, accounts []*AccountSender, minBalan
 	return nil
 }
 
-// GetNextNonce returns the current nonce WITHOUT incrementing (thread-safe)
-// Call IncrementNonce() after successful transaction submission
+// GetNextNonce atomically gets and increments the nonce (lock-free)
+// This allows multiple workers to pipeline transactions without blocking
 func (a *AccountSender) GetNextNonce() uint64 {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.nonce
+	return atomic.AddUint64(&a.nonce, 1) - 1
 }
 
-// IncrementNonce increments the local nonce after successful submission
+// IncrementNonce increments the local nonce (for compatibility, but GetNextNonce already does this)
 func (a *AccountSender) IncrementNonce() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.nonce++
+	atomic.AddUint64(&a.nonce, 1)
 }
 
-// ResyncNonce fetches nonce from blockchain
+// ResyncNonce fetches nonce from blockchain and updates atomically
 func (a *AccountSender) ResyncNonce(ctx context.Context) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	nonce, err := a.client.PendingNonceAt(ctx, a.from)
 	if err != nil {
 		return err
 	}
 
-	a.nonce = nonce
+	// Atomically store the new nonce
+	atomic.StoreUint64(&a.nonce, nonce)
 	return nil
 }
 
@@ -227,7 +265,5 @@ func (a *AccountSender) From() common.Address {
 
 // CurrentNonce returns the current local nonce without incrementing (thread-safe)
 func (a *AccountSender) CurrentNonce() uint64 {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.nonce
+	return atomic.LoadUint64(&a.nonce)
 }

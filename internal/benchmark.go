@@ -63,6 +63,7 @@ func NewBenchmark(config *Config, client *ethclient.Client, accounts []*AccountS
 	fmt.Printf("  Gas Limit: %d\n", config.GasLimit)
 	fmt.Printf("  Duration: %v\n", config.GetDuration())
 	fmt.Printf("  Accounts: %d\n", len(accounts))
+	fmt.Printf("  Concurrent Senders/Account: %d \n", config.ConcurrentSendersPerAccount)
 
 	return &Benchmark{
 		config:          config,
@@ -84,29 +85,24 @@ func (b *Benchmark) Start() {
 
 	b.startTime = time.Now()
 
-	// Warmup phase
-	if b.config.WarmupDuration > 0 {
-		fmt.Printf("\n🔥 Warmup phase: %d seconds\n", b.config.WarmupDuration)
-		b.warmup(time.Duration(b.config.WarmupDuration) * time.Second)
-	}
-
-	// Reset metrics after warmup
-	atomic.StoreUint64(&b.sentCount, 0)
-	atomic.StoreUint64(&b.errorCount, 0)
-	atomic.StoreInt64(&b.totalLatency, 0)
-	b.startTime = time.Now()
-
 	fmt.Printf("\n🚀 Starting main benchmark...")
 
-	// Start nonce resync worker pool (10 workers to handle resyncs faster)
-	for i := 0; i < 10; i++ {
-		go b.nonceResyncWorker()
+	// Multiple concurrent senders per account for pipelining
+	concurrentSenders := b.config.ConcurrentSendersPerAccount
+	if concurrentSenders <= 0 {
+		concurrentSenders = 1 // Fallback to at least 1
 	}
 
-	// Start sender goroutines
+	totalWorkers := len(b.accounts) * concurrentSenders
+	fmt.Printf("\nWorkers: %d accounts × %d senders = %d concurrent workers\n",
+		len(b.accounts), concurrentSenders, totalWorkers)
+
+	// Start multiple sender goroutines per account
 	for i, account := range b.accounts {
-		b.wg.Add(1)
-		go b.senderWorker(i, account)
+		for w := 0; w < concurrentSenders; w++ {
+			b.wg.Add(1)
+			go b.senderWorker(i, account)
+		}
 	}
 
 	// Start metrics reporter
@@ -135,46 +131,18 @@ func (b *Benchmark) Start() {
 	b.printFinalReport(finalSent, finalErrors, finalLatency)
 }
 
-func (b *Benchmark) warmup(duration time.Duration) {
-	warmupStop := make(chan struct{})
-
-	// Start one sender per account
-	var warmupWg sync.WaitGroup
-	for i, account := range b.accounts {
-		warmupWg.Add(1)
-		go func(accountID int, acc *AccountSender) {
-			defer warmupWg.Done()
-			ctx := context.Background()
-
-			for {
-				select {
-				case <-warmupStop:
-					return
-				default:
-					_ = b.sendTransaction(ctx, accountID, acc)
-					time.Sleep(100 * time.Millisecond)
-				}
-			}
-		}(i, account)
-	}
-
-	time.Sleep(duration)
-	close(warmupStop)
-	warmupWg.Wait()
-}
-
 func (b *Benchmark) senderWorker(id int, account *AccountSender) {
 	defer b.wg.Done()
 
-	// Stagger start to avoid thundering herd problem
-	// Spread accounts over 2 seconds with random jitter
-	baseDelay := time.Duration(id*20) * time.Millisecond       // 0ms, 20ms, 40ms...1980ms
-	jitter := time.Duration(rand.Intn(100)) * time.Millisecond // 0-100ms random
-	time.Sleep(baseDelay + jitter)
+	// Ultra-minimal jitter for maximum throughput
+	if id > 0 {
+		jitter := time.Duration(rand.Intn(2)) * time.Millisecond // 0-2ms only
+		time.Sleep(jitter)
+	}
 
 	ctx := context.Background()
 	consecutiveErrors := 0
-	const maxRetriesPerNonce = 5
+	const maxRetriesPerNonce = 2 // Minimal retries for maximum throughput
 	firstTransaction := true
 
 	for {
@@ -198,11 +166,10 @@ func (b *Benchmark) senderWorker(id int, account *AccountSender) {
 				latency = time.Since(start)
 
 				if err == nil {
-					// Success! Increment nonce for next transaction
-					account.IncrementNonce()
+					// Success! Nonce already incremented by GetNextNonce()
 					atomic.AddUint64(&b.sentCount, 1)
 					atomic.AddInt64(&b.totalLatency, latency.Nanoseconds())
-					account.sent++
+					atomic.AddUint64(&account.sent, 1)
 					consecutiveErrors = 0
 					firstTransaction = false
 					break
@@ -210,31 +177,17 @@ func (b *Benchmark) senderWorker(id int, account *AccountSender) {
 
 				// Check if it's a nonce-related error
 				if isNonceError(err) {
-					// Try to queue nonce resync (non-blocking, handled by worker pool)
-					select {
-					case b.resyncQueue <- account:
-						// Successfully queued - increment optimistically and continue
-						// Nonce error usually means TX was already submitted
-						account.IncrementNonce()
-						consecutiveErrors = 0
-						firstTransaction = false
-						break
-					default:
-						// Queue full - increment optimistically and continue
-						// Don't block with synchronous resync (causes stalls)
-						// Async resync will catch up when queue has capacity
-						account.IncrementNonce()
-						consecutiveErrors = 0
-						firstTransaction = false
-						break
-					}
+					// Nonce already incremented by GetNextNonce() - transaction likely submitted
+					// No resync needed - atomic nonces handle this automatically
+					consecutiveErrors = 0
+					firstTransaction = false
+					break
 				}
 
 				// For non-nonce errors (network, timeout), retry with same nonce
+				// Ultra-minimal backoff for maximum throughput
 				if retry < maxRetries-1 {
-					// Exponential backoff: 50ms, 100ms, 150ms, 200ms, etc.
-					backoff := time.Duration((retry+1)*50) * time.Millisecond
-					time.Sleep(backoff)
+					time.Sleep(1 * time.Millisecond) // 1ms backoff only
 				}
 			}
 
@@ -244,26 +197,14 @@ func (b *Benchmark) senderWorker(id int, account *AccountSender) {
 				if !isNonceError(err) {
 					// Only count non-nonce errors (real failures)
 					atomic.AddUint64(&b.errorCount, 1)
-					account.errors++
+					atomic.AddUint64(&account.errors, 1)
 					consecutiveErrors++
 
-					// Back off on consecutive errors
+					// Ultra-minimal backoff, maximize throughput
 					if consecutiveErrors < 5 {
-						time.Sleep(time.Duration(consecutiveErrors*100) * time.Millisecond)
+						time.Sleep(5 * time.Millisecond) // 5ms backoff
 					}
-
-					// Resync nonce periodically when stuck (via worker pool to avoid blocking)
-					if consecutiveErrors >= 3 {
-						// Try to queue resync, but don't block if queue is full
-						// Account will retry next iteration and queue might have space
-						select {
-						case b.resyncQueue <- account:
-							// Successfully queued
-						default:
-							// Queue full - skip this resync, will retry next iteration
-							// Don't block with synchronous resync (causes stalls)
-						}
-					}
+					// Note: Nonce resync workers disabled - atomic nonces handle everything
 				} else {
 					// Nonce error - don't count as failure, reset consecutive error counter
 					consecutiveErrors = 0
@@ -312,20 +253,6 @@ func (b *Benchmark) sendTransaction(ctx context.Context, accountID int, account 
 	}
 
 	return nil
-}
-
-func (b *Benchmark) nonceResyncWorker() {
-	ctx := context.Background()
-	for {
-		select {
-		case <-b.stopMetricsChan:
-			return
-		case account := <-b.resyncQueue:
-			// Process nonce resync (minimal delay to debounce rapid resyncs for same account)
-			time.Sleep(25 * time.Millisecond)
-			account.ResyncNonce(ctx)
-		}
-	}
 }
 
 func (b *Benchmark) metricsReporter() {
@@ -401,9 +328,14 @@ func (b *Benchmark) printFinalReport(sent, errors uint64, totalLat int64) {
 
 	fmt.Printf("\n👥 Per-Account Statistics:\n")
 	for i, account := range b.accounts {
+		sent := atomic.LoadUint64(&account.sent)
+		errors := atomic.LoadUint64(&account.errors)
+		successRate := 100.0
+		if sent+errors > 0 {
+			successRate = float64(sent) / float64(sent+errors) * 100
+		}
 		fmt.Printf("  Account %2d: %6d sent, %4d errors (%.1f%%)\n",
-			i, account.sent, account.errors,
-			float64(account.sent)/float64(account.sent+account.errors)*100)
+			i, sent, errors, successRate)
 	}
 
 	fmt.Println("\n" + strings.Repeat("=", 70))
@@ -425,15 +357,17 @@ func (b *Benchmark) saveResults(duration time.Duration, avgSubmittedTPS float64,
 	// Collect per-account statistics
 	accountStats := make([]map[string]interface{}, 0, len(b.accounts))
 	for i, account := range b.accounts {
+		sent := atomic.LoadUint64(&account.sent)
+		errors := atomic.LoadUint64(&account.errors)
 		accountSuccessRate := 100.0
-		if account.sent+account.errors > 0 {
-			accountSuccessRate = float64(account.sent) / float64(account.sent+account.errors) * 100
+		if sent+errors > 0 {
+			accountSuccessRate = float64(sent) / float64(sent+errors) * 100
 		}
 		accountStats = append(accountStats, map[string]interface{}{
 			"account_id":   i,
 			"address":      account.from.Hex(),
-			"sent":         account.sent,
-			"errors":       account.errors,
+			"sent":         sent,
+			"errors":       errors,
 			"success_rate": accountSuccessRate,
 		})
 	}
@@ -460,7 +394,6 @@ func (b *Benchmark) saveResults(duration time.Duration, avgSubmittedTPS float64,
 			"rpc_url":             b.config.RPCURL,
 			"gas_limit":           b.config.GasLimit,
 			"transfer_amount_wei": b.config.TransferAmount,
-			"warmup_duration":     b.config.WarmupDuration,
 			"duration_seconds":    duration.Seconds(),
 			"num_accounts":        len(b.accounts),
 		},

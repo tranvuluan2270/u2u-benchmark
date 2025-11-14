@@ -7,7 +7,7 @@
   "private_keys_file": "test_keys.json",
   "report_interval_seconds": 1,
   "output_file": "benchmark_results.json",
-  "max_retries": 5,
-  "retry_delay_ms": 150,
-  "warmup_duration_seconds": 5
+  "max_retries": 2,
+  "retry_delay_ms": 1,
+  "concurrent_senders_per_account": 5
 }

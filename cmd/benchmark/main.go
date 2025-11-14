@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"u2u-tps-benchmark/internal"
-
-	"github.com/unicornultrafoundation/go-u2u/ethclient"
 )
 
 func main() {
@@ -58,9 +56,10 @@ func main() {
 	fmt.Println("║        U2U Blockchain TPS Benchmark        ║")
 	fmt.Println("╚════════════════════════════════════════════╝")
 
-	// Connect to RPC
+	// Connect to RPC with optimized connection pool
 	fmt.Printf("🔌 Connecting to RPC: %s\n", config.RPCURL)
-	client, err := ethclient.Dial(config.RPCURL)
+	// Use connection pool that supports 2000+ concurrent connections
+	client, err := internal.CreateOptimizedClient(config.RPCURL, 2000)
 	if err != nil {
 		log.Fatalf("\nFailed to connect to RPC: %v", err)
 	}
